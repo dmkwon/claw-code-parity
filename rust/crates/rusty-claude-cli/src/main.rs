@@ -50,7 +50,7 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
+use tools::{execute_agent_with_mcp, GlobalToolRegistry, McpDispatchFn, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
@@ -5897,6 +5897,25 @@ impl CliToolExecutor {
         .map_err(|error| ToolError::new(error.to_string()))
     }
 
+    fn execute_agent_tool(&self, value: &serde_json::Value) -> Result<String, ToolError> {
+        let mcp_tools = self.tool_registry.runtime_tool_definitions();
+        let mcp_state = self.mcp_state.clone();
+        let mcp_dispatch: Option<McpDispatchFn> = Some(Arc::new(
+            move |qualified: &str, args: serde_json::Value| -> Result<String, String> {
+                let Some(state) = mcp_state.as_ref() else {
+                    return Err(String::from("no MCP servers configured"));
+                };
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state
+                    .call_tool(qualified, Some(args))
+                    .map_err(|error| error.to_string())
+            },
+        ));
+        execute_agent_with_mcp(value, mcp_tools, mcp_dispatch).map_err(ToolError::new)
+    }
+
     fn execute_runtime_tool(
         &self,
         tool_name: &str,
@@ -5952,7 +5971,9 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
+        let result = if tool_name == "Agent" {
+            self.execute_agent_tool(&value)
+        } else if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
