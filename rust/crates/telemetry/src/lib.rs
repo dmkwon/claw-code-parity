@@ -115,12 +115,11 @@ impl AnthropicRequestProfile {
         for (key, value) in &self.extra_body {
             object.insert(key.clone(), value.clone());
         }
-        if !self.betas.is_empty() {
-            object.insert(
-                "betas".to_string(),
-                Value::Array(self.betas.iter().cloned().map(Value::String).collect()),
-            );
-        }
+        // Beta features are advertised exclusively through the `anthropic-beta`
+        // header (see `header_pairs`). The standard `/v1/messages` endpoint
+        // rejects a top-level `betas` body field with
+        // `400 invalid_request_error: betas: Extra inputs are not permitted`,
+        // so it must never be serialized into the request body.
         Ok(body)
     }
 }
@@ -602,14 +601,9 @@ mod tests {
             body["metadata"]["source"],
             Value::String("test".to_string())
         );
-        assert_eq!(
-            body["betas"],
-            serde_json::json!([
-                "claude-code-20250219",
-                "prompt-caching-scope-2026-01-05",
-                "tools-2026-04-01"
-            ])
-        );
+        // Betas are sent via the `anthropic-beta` header only; the body must not
+        // carry a `betas` field or the real Anthropic API rejects the request.
+        assert!(body.get("betas").is_none());
     }
 
     #[test]
