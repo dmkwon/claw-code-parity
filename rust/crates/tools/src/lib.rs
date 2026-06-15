@@ -1975,12 +1975,37 @@ pub fn execute_agent_with_mcp(
     mcp_dispatch: Option<McpDispatchFn>,
 ) -> Result<String, String> {
     let parsed = from_value::<AgentInput>(input)?;
-    to_pretty_json(execute_agent_with_spawn_ctx(
+    // Run the sub-agent synchronously so the Agent tool returns its final
+    // result directly. The previous behaviour spawned a detached thread and
+    // returned a "running" manifest, which is unusable in one-shot mode: when
+    // the parent process exits the in-process sub-agent thread is killed before
+    // it finishes. Blocking here also keeps the parent alive for the duration.
+    let result_cell: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cell = std::sync::Arc::clone(&result_cell);
+    let spawn_result = execute_agent_with_spawn_ctx(
         parsed,
-        spawn_agent_job,
+        move |job| {
+            let outcome = run_agent_turn(&job);
+            match &outcome {
+                Ok(text) => {
+                    let _ = persist_agent_terminal_state(&job.manifest, "completed", Some(text.as_str()), None);
+                }
+                Err(error) => {
+                    let _ = persist_agent_terminal_state(&job.manifest, "failed", None, Some(error.clone()));
+                }
+            }
+            *cell.lock().expect("agent result lock") = Some(outcome.clone());
+            outcome.map(|_| ())
+        },
         mcp_tools,
         mcp_dispatch,
-    )?)
+    );
+    let captured = result_cell.lock().expect("agent result lock").take();
+    match captured {
+        Some(outcome) => outcome,
+        None => spawn_result.map(|_| String::new()),
+    }
 }
 
 fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
@@ -3196,12 +3221,16 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+fn run_agent_turn(job: &AgentJob) -> Result<String, String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
-    let final_text = final_assistant_text(&summary);
+    Ok(final_assistant_text(&summary))
+}
+
+fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+    let final_text = run_agent_turn(job)?;
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
 }
 
@@ -5579,6 +5608,51 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires workspace-write permission"));
+    }
+
+    #[test]
+    fn subagent_tool_executor_routes_mcp_tools_to_dispatch() {
+        use std::sync::{Arc, Mutex};
+
+        let captured: Arc<Mutex<Option<(String, serde_json::Value)>>> = Arc::new(Mutex::new(None));
+        let captured_for_closure = Arc::clone(&captured);
+        let dispatch: super::McpDispatchFn = Arc::new(move |name: &str, args: serde_json::Value| {
+            *captured_for_closure.lock().expect("capture lock") = Some((name.to_string(), args));
+            Ok("retrieved facts".to_string())
+        });
+        let mut executor =
+            SubagentToolExecutor::new(BTreeSet::from([String::from("mcp__knowmax__knowmax_query")]))
+                .with_mcp_dispatch(Some(dispatch));
+
+        let output = executor
+            .execute(
+                "mcp__knowmax__knowmax_query",
+                &json!({ "query": "who certifies" }).to_string(),
+            )
+            .expect("mcp tool should route to the dispatch closure");
+
+        assert_eq!(output, "retrieved facts");
+        let (name, args) = captured
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("dispatch should have been invoked");
+        assert_eq!(name, "mcp__knowmax__knowmax_query");
+        assert_eq!(args["query"], "who certifies");
+    }
+
+    #[test]
+    fn subagent_tool_executor_mcp_without_dispatch_errors() {
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from(
+            "mcp__knowmax__knowmax_query",
+        )]));
+        let error = executor
+            .execute(
+                "mcp__knowmax__knowmax_query",
+                &json!({ "query": "x" }).to_string(),
+            )
+            .expect_err("mcp tool without a wired dispatch should error");
+        assert!(error.to_string().contains("no MCP dispatch wired"));
     }
 
     #[test]
