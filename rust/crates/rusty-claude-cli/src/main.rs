@@ -5084,6 +5084,7 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
+            let mut thinking_text = String::new();
 
             while let Some(event) = stream
                 .next_event()
@@ -5124,8 +5125,10 @@ impl ApiClient for AnthropicRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
+                        ContentBlockDelta::ThinkingDelta { thinking } => {
+                            thinking_text.push_str(&thinking);
+                        }
+                        ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
@@ -5158,6 +5161,8 @@ impl ApiClient for AnthropicRuntimeClient {
                     }
                 }
             }
+
+            apply_thinking_only_fallback(&mut events, &thinking_text, out)?;
 
             push_prompt_cache_record(&self.client, &mut events);
 
@@ -5811,19 +5816,54 @@ fn push_output_block(
     Ok(())
 }
 
+/// Surface accumulated reasoning as text when a response produced no usable content.
+///
+/// Some providers — notably local models served behind an Anthropic-compatible proxy —
+/// emit only `thinking` deltas with no final text or tool_use. The runtime rejects a
+/// message with zero content blocks ("assistant stream produced no content"), so when that
+/// happens we fall back to surfacing the captured reasoning as text to keep the turn usable
+/// instead of erroring out. When the response already has usable content (non-empty text or
+/// a tool_use) the reasoning is left out, preserving the normal behavior of hiding thinking.
+///
+/// Returns `true` when the fallback was applied.
+fn apply_thinking_only_fallback(
+    events: &mut Vec<AssistantEvent>,
+    thinking_text: &str,
+    out: &mut (impl Write + ?Sized),
+) -> Result<bool, RuntimeError> {
+    let has_usable_content = events.iter().any(|event| {
+        matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+            || matches!(event, AssistantEvent::ToolUse { .. })
+    });
+    if has_usable_content || thinking_text.trim().is_empty() {
+        return Ok(false);
+    }
+    write!(out, "{thinking_text}")
+        .and_then(|()| out.flush())
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+    events.push(AssistantEvent::TextDelta(thinking_text.to_string()));
+    Ok(true)
+}
+
 fn response_to_events(
     response: MessageResponse,
     out: &mut (impl Write + ?Sized),
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
+    let mut thinking_text = String::new();
 
     for block in response.content {
+        if let OutputContentBlock::Thinking { thinking, .. } = &block {
+            thinking_text.push_str(thinking);
+        }
         push_output_block(block, out, &mut events, &mut pending_tool, false)?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
     }
+
+    apply_thinking_only_fallback(&mut events, &thinking_text, out)?;
 
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
     events.push(AssistantEvent::MessageStop);
@@ -6181,7 +6221,8 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
+        apply_thinking_only_fallback, build_runtime_plugin_state_with_loader,
+        build_runtime_with_plugin_state,
         create_managed_session_handle, delete_merged_local_branches_in, describe_tool_progress,
         filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
         format_commit_skipped_report, format_compact_report, format_cost_report,
@@ -8167,6 +8208,122 @@ UU conflicted.rs",
             AssistantEvent::TextDelta(text) if text == "Final answer"
         ));
         assert!(!String::from_utf8(out).expect("utf8").contains("step 1"));
+    }
+
+    #[test]
+    fn response_to_events_surfaces_thinking_only_response_as_text() {
+        let mut out = Vec::new();
+        let events = response_to_events(
+            MessageResponse {
+                id: "msg-4".to_string(),
+                kind: "message".to_string(),
+                model: "claude-opus-4-6".to_string(),
+                role: "assistant".to_string(),
+                content: vec![OutputContentBlock::Thinking {
+                    thinking: "only reasoning, no answer".to_string(),
+                    signature: None,
+                }],
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                request_id: None,
+            },
+            &mut out,
+        )
+        .expect("response conversion should succeed");
+
+        // A thinking-only response must not collapse to zero content blocks; the captured
+        // reasoning is surfaced as text so the turn stays usable.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AssistantEvent::TextDelta(text) if text == "only reasoning, no answer"
+        )));
+        assert!(String::from_utf8(out)
+            .expect("utf8")
+            .contains("only reasoning, no answer"));
+    }
+
+    #[test]
+    fn thinking_fallback_surfaces_reasoning_when_no_usable_content() {
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        let applied = apply_thinking_only_fallback(&mut events, "deep reasoning", &mut out)
+            .expect("fallback should succeed");
+
+        assert!(applied, "fallback must fire for a thinking-only response");
+        assert!(matches!(
+            events.as_slice(),
+            [AssistantEvent::TextDelta(text)] if text == "deep reasoning"
+        ));
+        assert!(String::from_utf8(out)
+            .expect("utf8")
+            .contains("deep reasoning"));
+    }
+
+    #[test]
+    fn thinking_fallback_skips_when_text_already_present() {
+        let mut out = Vec::new();
+        let mut events = vec![AssistantEvent::TextDelta("real answer".to_string())];
+
+        let applied = apply_thinking_only_fallback(&mut events, "hidden reasoning", &mut out)
+            .expect("fallback should succeed");
+
+        assert!(!applied, "fallback must not fire when usable text exists");
+        assert_eq!(events.len(), 1);
+        assert!(out.is_empty(), "reasoning must stay hidden when text is present");
+    }
+
+    #[test]
+    fn thinking_fallback_skips_when_tool_use_present() {
+        let mut out = Vec::new();
+        let mut events = vec![AssistantEvent::ToolUse {
+            id: "tool-1".to_string(),
+            name: "read_file".to_string(),
+            input: "{}".to_string(),
+        }];
+
+        let applied = apply_thinking_only_fallback(&mut events, "hidden reasoning", &mut out)
+            .expect("fallback should succeed");
+
+        assert!(!applied, "fallback must not fire when a tool_use exists");
+        assert_eq!(events.len(), 1);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn thinking_fallback_skips_when_reasoning_is_blank() {
+        let mut out = Vec::new();
+        let mut events = Vec::new();
+
+        let applied = apply_thinking_only_fallback(&mut events, "   \n\t", &mut out)
+            .expect("fallback should succeed");
+
+        assert!(!applied, "blank reasoning is not worth surfacing");
+        assert!(events.is_empty());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn thinking_fallback_fires_when_only_empty_text_delta_present() {
+        // An empty text delta is not "usable content"; a thinking-only response that also
+        // carried an empty text block must still surface its reasoning.
+        let mut out = Vec::new();
+        let mut events = vec![AssistantEvent::TextDelta(String::new())];
+
+        let applied = apply_thinking_only_fallback(&mut events, "reasoning only", &mut out)
+            .expect("fallback should succeed");
+
+        assert!(applied);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AssistantEvent::TextDelta(text) if text == "reasoning only"
+        )));
     }
 
     #[test]
