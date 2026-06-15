@@ -119,6 +119,9 @@ pub struct RuntimeToolDefinition {
     pub required_permission: PermissionMode,
 }
 
+/// Dispatch callback that lets a spawned sub-agent invoke MCP runtime tools through the main process state.
+pub type McpDispatchFn = std::sync::Arc<dyn Fn(&str, serde_json::Value) -> Result<String, String> + Send + Sync>;
+
 impl GlobalToolRegistry {
     #[must_use]
     pub fn builtin() -> Self {
@@ -307,6 +310,11 @@ impl GlobalToolRegistry {
     #[must_use]
     pub fn has_runtime_tool(&self, name: &str) -> bool {
         self.runtime_tools.iter().any(|tool| tool.name == name)
+    }
+
+    #[must_use]
+    pub fn runtime_tool_definitions(&self) -> Vec<RuntimeToolDefinition> {
+        self.runtime_tools.clone()
     }
 
     #[must_use]
@@ -1960,6 +1968,46 @@ fn run_agent(input: AgentInput) -> Result<String, String> {
     to_pretty_json(execute_agent(input)?)
 }
 
+/// Spawn an `Agent` sub-agent while threading the parent process's MCP tool definitions and dispatch callback into it.
+pub fn execute_agent_with_mcp(
+    input: &Value,
+    mcp_tools: Vec<RuntimeToolDefinition>,
+    mcp_dispatch: Option<McpDispatchFn>,
+) -> Result<String, String> {
+    let parsed = from_value::<AgentInput>(input)?;
+    // Run the sub-agent synchronously so the Agent tool returns its final
+    // result directly. The previous behaviour spawned a detached thread and
+    // returned a "running" manifest, which is unusable in one-shot mode: when
+    // the parent process exits the in-process sub-agent thread is killed before
+    // it finishes. Blocking here also keeps the parent alive for the duration.
+    let result_cell: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let cell = std::sync::Arc::clone(&result_cell);
+    let spawn_result = execute_agent_with_spawn_ctx(
+        parsed,
+        move |job| {
+            let outcome = run_agent_turn(&job);
+            match &outcome {
+                Ok(text) => {
+                    let _ = persist_agent_terminal_state(&job.manifest, "completed", Some(text.as_str()), None);
+                }
+                Err(error) => {
+                    let _ = persist_agent_terminal_state(&job.manifest, "failed", None, Some(error.clone()));
+                }
+            }
+            *cell.lock().expect("agent result lock") = Some(outcome.clone());
+            outcome.map(|_| ())
+        },
+        mcp_tools,
+        mcp_dispatch,
+    );
+    let captured = result_cell.lock().expect("agent result lock").take();
+    match captured {
+        Some(outcome) => outcome,
+        None => spawn_result.map(|_| String::new()),
+    }
+}
+
 fn run_tool_search(input: ToolSearchInput) -> Result<String, String> {
     to_pretty_json(execute_tool_search(input))
 }
@@ -2372,12 +2420,14 @@ struct AgentOutput {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct AgentJob {
     manifest: AgentOutput,
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    mcp_tools: Vec<RuntimeToolDefinition>,
+    mcp_dispatch: Option<McpDispatchFn>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3028,6 +3078,18 @@ fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOu
 where
     F: FnOnce(AgentJob) -> Result<(), String>,
 {
+    execute_agent_with_spawn_ctx(input, spawn_fn, Vec::new(), None)
+}
+
+fn execute_agent_with_spawn_ctx<F>(
+    input: AgentInput,
+    spawn_fn: F,
+    mcp_tools: Vec<RuntimeToolDefinition>,
+    mcp_dispatch: Option<McpDispatchFn>,
+) -> Result<AgentOutput, String>
+where
+    F: FnOnce(AgentJob) -> Result<(), String>,
+{
     if input.description.trim().is_empty() {
         return Err(String::from("description must not be empty"));
     }
@@ -3041,7 +3103,14 @@ where
     let output_file = output_dir.join(format!("{agent_id}.md"));
     let manifest_file = output_dir.join(format!("{agent_id}.json"));
     let normalized_subagent_type = normalize_subagent_type(input.subagent_type.as_deref());
-    let model = resolve_agent_model(input.model.as_deref());
+    let custom_def = load_custom_agent_def(&normalized_subagent_type);
+    let model = resolve_agent_model(
+        input
+            .model
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| custom_def.as_ref().and_then(|def| def.model.as_deref())),
+    );
     let agent_name = input
         .name
         .as_deref()
@@ -3049,8 +3118,28 @@ where
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| slugify_agent_name(&input.description));
     let created_at = iso8601_now();
-    let system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
-    let allowed_tools = allowed_tools_for_subagent(&normalized_subagent_type);
+    let mut system_prompt = build_agent_system_prompt(&normalized_subagent_type)?;
+    if let Some(custom_prompt) = custom_def
+        .as_ref()
+        .and_then(|def| def.system_prompt.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        system_prompt.push(custom_prompt.trim().to_string());
+    }
+
+    // Base allowed tools come from the custom agent definition when it lists any, else the builtin set.
+    let mut allowed_tools = match custom_def
+        .as_ref()
+        .and_then(|def| def.tools.as_ref())
+        .filter(|tools| !tools.is_empty())
+    {
+        Some(custom_tools) => allowed_tools_from_custom(custom_tools, &mcp_tools),
+        None => allowed_tools_for_subagent(&normalized_subagent_type),
+    };
+    // Always offer the available MCP tools to the sub-agent.
+    for tool in &mcp_tools {
+        allowed_tools.insert(tool.name.clone());
+    }
 
     let output_contents = format!(
         "# Agent Task
@@ -3093,6 +3182,8 @@ where
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        mcp_tools,
+        mcp_dispatch,
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -3130,12 +3221,16 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+fn run_agent_turn(job: &AgentJob) -> Result<String, String> {
     let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
-    let final_text = final_assistant_text(&summary);
+    Ok(final_assistant_text(&summary))
+}
+
+fn run_agent_job(job: &AgentJob) -> Result<(), String> {
+    let final_text = run_agent_turn(job)?;
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
 }
 
@@ -3148,10 +3243,11 @@ fn build_agent_runtime(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone(), job.mcp_tools.clone())?;
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
-        .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
+        .with_enforcer(PermissionEnforcer::new(permission_policy.clone()))
+        .with_mcp_dispatch(job.mcp_dispatch.clone());
     Ok(ConversationRuntime::new(
         Session::new(),
         api_client,
@@ -3400,11 +3496,16 @@ struct ProviderRuntimeClient {
     client: ProviderClient,
     model: String,
     allowed_tools: BTreeSet<String>,
+    mcp_tools: Vec<RuntimeToolDefinition>,
 }
 
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
-    fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
+    fn new(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        mcp_tools: Vec<RuntimeToolDefinition>,
+    ) -> Result<Self, String> {
         let model = resolve_model_alias(&model).clone();
         let client = ProviderClient::from_model(&model).map_err(|error| error.to_string())?;
         Ok(Self {
@@ -3412,6 +3513,7 @@ impl ProviderRuntimeClient {
             client,
             model,
             allowed_tools,
+            mcp_tools,
         })
     }
 }
@@ -3419,7 +3521,7 @@ impl ProviderRuntimeClient {
 impl ApiClient for ProviderRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
+        let mut tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
             .map(|spec| ToolDefinition {
                 name: spec.name.to_string(),
@@ -3427,6 +3529,15 @@ impl ApiClient for ProviderRuntimeClient {
                 input_schema: spec.input_schema,
             })
             .collect::<Vec<_>>();
+        for tool in &self.mcp_tools {
+            if self.allowed_tools.contains(&tool.name) {
+                tools.push(ToolDefinition {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    input_schema: tool.input_schema.clone(),
+                });
+            }
+        }
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
@@ -3532,6 +3643,7 @@ impl ApiClient for ProviderRuntimeClient {
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
     enforcer: Option<PermissionEnforcer>,
+    mcp_dispatch: Option<McpDispatchFn>,
 }
 
 impl SubagentToolExecutor {
@@ -3539,11 +3651,17 @@ impl SubagentToolExecutor {
         Self {
             allowed_tools,
             enforcer: None,
+            mcp_dispatch: None,
         }
     }
 
     fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
         self.enforcer = Some(enforcer);
+        self
+    }
+
+    fn with_mcp_dispatch(mut self, dispatch: Option<McpDispatchFn>) -> Self {
+        self.mcp_dispatch = dispatch;
         self
     }
 }
@@ -3557,6 +3675,14 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        if tool_name.starts_with("mcp__") {
+            let Some(dispatch) = self.mcp_dispatch.as_ref() else {
+                return Err(ToolError::new(format!(
+                    "MCP tool `{tool_name}` is unavailable: no MCP dispatch wired into this sub-agent"
+                )));
+            };
+            return dispatch(tool_name, value).map_err(ToolError::new);
+        }
         execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
             .map_err(ToolError::new)
     }
@@ -3823,10 +3949,250 @@ fn agent_store_dir() -> Result<std::path::PathBuf, String> {
         return Ok(std::path::PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".clawd-agents"));
+    // Only prefer a workspace root when the cwd is deep enough that `nth(2)` is not the filesystem root.
+    if cwd.components().count() >= 3 {
+        if let Some(workspace_root) = cwd.ancestors().nth(2) {
+            if dir_is_writable(workspace_root) {
+                return Ok(workspace_root.join(".clawd-agents"));
+            }
+        }
+    }
+    if let Some(home) = home_dir() {
+        return Ok(home.join(".claw").join("agents"));
     }
     Ok(cwd.join(".clawd-agents"))
+}
+
+fn dir_is_writable(path: &Path) -> bool {
+    let probe = path.join(".clawd-write-probe");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+#[derive(Debug, Default, Clone)]
+struct CustomAgentDef {
+    system_prompt: Option<String>,
+    tools: Option<Vec<String>>,
+    model: Option<String>,
+}
+
+/// Build the sub-agent allowlist from a custom agent definition's tool list, qualifying any MCP tools by suffix/exact match.
+fn allowed_tools_from_custom(
+    custom_tools: &[String],
+    mcp_tools: &[RuntimeToolDefinition],
+) -> BTreeSet<String> {
+    let mut allowed = BTreeSet::new();
+    for listed in custom_tools {
+        let listed = listed.trim();
+        if listed.is_empty() {
+            continue;
+        }
+        allowed.insert(listed.to_string());
+    }
+    // Map agent-listed names that match an MCP tool's full qualified name or its trailing segment.
+    for tool in mcp_tools {
+        let suffix = tool.name.rsplit("__").next().unwrap_or(tool.name.as_str());
+        if custom_tools
+            .iter()
+            .any(|listed| listed.trim() == tool.name || listed.trim() == suffix)
+        {
+            allowed.insert(tool.name.clone());
+        }
+    }
+    allowed
+}
+
+fn load_custom_agent_def(agent_name: &str) -> Option<CustomAgentDef> {
+    let agent_name = agent_name.trim();
+    if agent_name.is_empty() {
+        return None;
+    }
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        for ancestor in cwd.ancestors() {
+            roots.push(ancestor.join(".codex").join("agents"));
+            roots.push(ancestor.join(".claude").join("agents"));
+        }
+    }
+    if let Some(codex_home) = std::env::var_os("CODEX_HOME") {
+        roots.push(PathBuf::from(codex_home).join("agents"));
+    }
+    if let Some(home) = home_dir() {
+        roots.push(home.join(".codex").join("agents"));
+    }
+
+    for root in roots {
+        if let Some(def) = load_custom_agent_from_root(&root, agent_name) {
+            return Some(def);
+        }
+    }
+    None
+}
+
+fn load_custom_agent_from_root(root: &Path, agent_name: &str) -> Option<CustomAgentDef> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !stem.eq_ignore_ascii_case(agent_name) {
+            continue;
+        }
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase);
+        let contents = std::fs::read_to_string(&path).ok()?;
+        match extension.as_deref() {
+            Some("md") => return Some(parse_custom_agent_markdown(&contents)),
+            Some("toml") => return Some(parse_custom_agent_toml(&contents)),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_custom_agent_markdown(contents: &str) -> CustomAgentDef {
+    let mut def = CustomAgentDef::default();
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        // No frontmatter — the whole document is the system prompt.
+        let body = contents.trim();
+        if !body.is_empty() {
+            def.system_prompt = Some(body.to_string());
+        }
+        return def;
+    }
+
+    let mut tools: Vec<String> = Vec::new();
+    let mut collecting_tools_list = false;
+    let mut frontmatter_closed = false;
+    let mut body_lines: Vec<&str> = Vec::new();
+
+    for line in lines {
+        if frontmatter_closed {
+            body_lines.push(line);
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            frontmatter_closed = true;
+            continue;
+        }
+        if collecting_tools_list {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let item = unquote_agent_value(item.trim());
+                if !item.is_empty() {
+                    tools.push(item);
+                }
+                continue;
+            }
+            collecting_tools_list = false;
+        }
+        if let Some(value) = trimmed.strip_prefix("model:") {
+            let value = unquote_agent_value(value.trim());
+            if !value.is_empty() {
+                def.model = Some(value);
+            }
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("tools:") {
+            let value = value.trim();
+            if value.is_empty() {
+                // Following lines may be a YAML block list of `- item`.
+                collecting_tools_list = true;
+            } else {
+                tools.extend(parse_tools_csv(&unquote_agent_value(value)));
+            }
+        }
+    }
+
+    if !tools.is_empty() {
+        def.tools = Some(tools);
+    }
+    let body = body_lines.join("\n");
+    let body = body.trim();
+    if !body.is_empty() {
+        def.system_prompt = Some(body.to_string());
+    }
+    def
+}
+
+fn parse_custom_agent_toml(contents: &str) -> CustomAgentDef {
+    let tools = parse_toml_string_value(contents, "tools")
+        .map(|tools| parse_tools_csv(&tools))
+        .filter(|tools| !tools.is_empty());
+    CustomAgentDef {
+        system_prompt: None,
+        tools,
+        model: parse_toml_string_value(contents, "model"),
+    }
+}
+
+fn parse_tools_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_toml_string_value(contents: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key} =");
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(value) = trimmed.strip_prefix(&prefix) else {
+            continue;
+        };
+        let value = value.trim();
+        let Some(value) = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        else {
+            continue;
+        };
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn unquote_agent_value(value: &str) -> String {
+    value
+        .strip_prefix('"')
+        .and_then(|trimmed| trimmed.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|trimmed| trimmed.strip_suffix('\''))
+        })
+        .unwrap_or(value)
+        .trim()
+        .to_string()
 }
 
 fn make_agent_id() -> String {
@@ -5242,6 +5608,51 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires workspace-write permission"));
+    }
+
+    #[test]
+    fn subagent_tool_executor_routes_mcp_tools_to_dispatch() {
+        use std::sync::{Arc, Mutex};
+
+        let captured: Arc<Mutex<Option<(String, serde_json::Value)>>> = Arc::new(Mutex::new(None));
+        let captured_for_closure = Arc::clone(&captured);
+        let dispatch: super::McpDispatchFn = Arc::new(move |name: &str, args: serde_json::Value| {
+            *captured_for_closure.lock().expect("capture lock") = Some((name.to_string(), args));
+            Ok("retrieved facts".to_string())
+        });
+        let mut executor =
+            SubagentToolExecutor::new(BTreeSet::from([String::from("mcp__knowmax__knowmax_query")]))
+                .with_mcp_dispatch(Some(dispatch));
+
+        let output = executor
+            .execute(
+                "mcp__knowmax__knowmax_query",
+                &json!({ "query": "who certifies" }).to_string(),
+            )
+            .expect("mcp tool should route to the dispatch closure");
+
+        assert_eq!(output, "retrieved facts");
+        let (name, args) = captured
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("dispatch should have been invoked");
+        assert_eq!(name, "mcp__knowmax__knowmax_query");
+        assert_eq!(args["query"], "who certifies");
+    }
+
+    #[test]
+    fn subagent_tool_executor_mcp_without_dispatch_errors() {
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from(
+            "mcp__knowmax__knowmax_query",
+        )]));
+        let error = executor
+            .execute(
+                "mcp__knowmax__knowmax_query",
+                &json!({ "query": "x" }).to_string(),
+            )
+            .expect_err("mcp tool without a wired dispatch should error");
+        assert!(error.to_string().contains("no MCP dispatch wired"));
     }
 
     #[test]
