@@ -18,6 +18,7 @@ mod lane_events;
 pub mod lsp_client;
 mod mcp;
 mod mcp_client;
+mod mcp_http;
 pub mod mcp_lifecycle_hardened;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
