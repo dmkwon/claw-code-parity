@@ -13,7 +13,10 @@ use tokio::time::timeout;
 
 use crate::config::{McpTransport, RuntimeConfig, ScopedMcpServerConfig};
 use crate::mcp::mcp_tool_name;
-use crate::mcp_client::{McpClientBootstrap, McpClientTransport, McpStdioTransport};
+use crate::mcp_client::{
+    McpClientBootstrap, McpClientTransport, McpStdioTransport, DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS,
+};
+use crate::mcp_http::McpHttpClient;
 use crate::mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase,
 };
@@ -458,10 +461,100 @@ struct ToolRoute {
     raw_name: String,
 }
 
+/// Active connection backing a managed MCP server. Transport-agnostic so the
+/// manager dispatches `initialize`/`tools/list`/`tools/call` uniformly.
+#[derive(Debug)]
+enum ManagedConnection {
+    Stdio(McpStdioProcess),
+    Http(McpHttpClient),
+}
+
+impl ManagedConnection {
+    fn has_exited(&mut self) -> io::Result<bool> {
+        match self {
+            // HTTP transport is stateless; there is no process to outlive.
+            Self::Http(_) => Ok(false),
+            Self::Stdio(process) => process.has_exited(),
+        }
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        match self {
+            Self::Http(_) => Ok(()),
+            Self::Stdio(process) => process.shutdown().await,
+        }
+    }
+
+    async fn initialize(
+        &mut self,
+        id: JsonRpcId,
+        stdio_params: McpInitializeParams,
+    ) -> io::Result<JsonRpcResponse<McpInitializeResult>> {
+        match self {
+            Self::Stdio(process) => process.initialize(id, stdio_params).await,
+            Self::Http(client) => {
+                client
+                    .initialize(id, crate::mcp_http::default_http_initialize_params())
+                    .await
+            }
+        }
+    }
+
+    async fn list_tools(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListToolsParams>,
+    ) -> io::Result<JsonRpcResponse<McpListToolsResult>> {
+        match self {
+            Self::Stdio(process) => process.list_tools(id, params).await,
+            Self::Http(client) => client.list_tools(id, params).await,
+        }
+    }
+
+    async fn call_tool(
+        &mut self,
+        id: JsonRpcId,
+        params: McpToolCallParams,
+    ) -> io::Result<JsonRpcResponse<McpToolCallResult>> {
+        match self {
+            Self::Stdio(process) => process.call_tool(id, params).await,
+            Self::Http(client) => client.call_tool(id, params).await,
+        }
+    }
+
+    async fn list_resources(
+        &mut self,
+        id: JsonRpcId,
+        params: Option<McpListResourcesParams>,
+    ) -> io::Result<JsonRpcResponse<McpListResourcesResult>> {
+        match self {
+            Self::Stdio(process) => process.list_resources(id, params).await,
+            Self::Http(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "resources/list is not supported over the HTTP MCP transport",
+            )),
+        }
+    }
+
+    async fn read_resource(
+        &mut self,
+        id: JsonRpcId,
+        params: McpReadResourceParams,
+    ) -> io::Result<JsonRpcResponse<McpReadResourceResult>> {
+        match self {
+            Self::Stdio(process) => process.read_resource(id, params).await,
+            Self::Http(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "resources/read is not supported over the HTTP MCP transport",
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ManagedMcpServer {
     bootstrap: McpClientBootstrap,
-    process: Option<McpStdioProcess>,
+    connection: Option<ManagedConnection>,
     initialized: bool,
 }
 
@@ -469,7 +562,7 @@ impl ManagedMcpServer {
     fn new(bootstrap: McpClientBootstrap) -> Self {
         Self {
             bootstrap,
-            process: None,
+            connection: None,
             initialized: false,
         }
     }
@@ -495,7 +588,10 @@ impl McpServerManager {
         let mut unsupported_servers = Vec::new();
 
         for (server_name, server_config) in servers {
-            if server_config.transport() == McpTransport::Stdio {
+            if matches!(
+                server_config.transport(),
+                McpTransport::Stdio | McpTransport::Http
+            ) {
                 let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
                 managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
             } else {
@@ -640,18 +736,18 @@ impl McpServerManager {
         let response =
             {
                 let server = self.server_mut(&route.server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
+                let connection = server.connection.as_mut().ok_or_else(|| {
                     McpServerManagerError::InvalidResponse {
                         server_name: route.server_name.clone(),
                         method: "tools/call",
-                        details: "server process missing after initialization".to_string(),
+                        details: "server connection missing after initialization".to_string(),
                     }
                 })?;
                 Self::run_process_request(
                     &route.server_name,
                     "tools/call",
                     timeout_ms,
-                    process.call_tool(
+                    connection.call_tool(
                         request_id,
                         McpToolCallParams {
                             name: route.raw_name,
@@ -723,10 +819,10 @@ impl McpServerManager {
         let server_names = self.servers.keys().cloned().collect::<Vec<_>>();
         for server_name in server_names {
             let server = self.server_mut(&server_name)?;
-            if let Some(process) = server.process.as_mut() {
-                process.shutdown().await?;
+            if let Some(connection) = server.connection.as_mut() {
+                connection.shutdown().await?;
             }
-            server.process = None;
+            server.connection = None;
             server.initialized = false;
         }
         Ok(())
@@ -763,18 +859,19 @@ impl McpServerManager {
                 })?;
         match &server.bootstrap.transport {
             McpClientTransport::Stdio(transport) => Ok(transport.resolved_tool_call_timeout_ms()),
+            McpClientTransport::Http(_) => Ok(DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS),
             other => Err(McpServerManagerError::InvalidResponse {
                 server_name: server_name.to_string(),
                 method: "tools/call",
-                details: format!("unsupported MCP transport for stdio manager: {other:?}"),
+                details: format!("unsupported MCP transport for manager: {other:?}"),
             }),
         }
     }
 
     fn server_process_exited(&mut self, server_name: &str) -> Result<bool, McpServerManagerError> {
         let server = self.server_mut(server_name)?;
-        match server.process.as_mut() {
-            Some(process) => Ok(process.has_exited()?),
+        match server.connection.as_mut() {
+            Some(connection) => Ok(connection.has_exited()?),
             None => Ok(false),
         }
     }
@@ -814,18 +911,18 @@ impl McpServerManager {
             let request_id = self.take_request_id();
             let response = {
                 let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
+                let connection = server.connection.as_mut().ok_or_else(|| {
                     McpServerManagerError::InvalidResponse {
                         server_name: server_name.to_string(),
                         method: "tools/list",
-                        details: "server process missing after initialization".to_string(),
+                        details: "server connection missing after initialization".to_string(),
                     }
                 })?;
                 Self::run_process_request(
                     server_name,
                     "tools/list",
                     MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.list_tools(
+                    connection.list_tools(
                         request_id,
                         Some(McpListToolsParams {
                             cursor: cursor.clone(),
@@ -882,18 +979,18 @@ impl McpServerManager {
             let request_id = self.take_request_id();
             let response = {
                 let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
+                let connection = server.connection.as_mut().ok_or_else(|| {
                     McpServerManagerError::InvalidResponse {
                         server_name: server_name.to_string(),
                         method: "resources/list",
-                        details: "server process missing after initialization".to_string(),
+                        details: "server connection missing after initialization".to_string(),
                     }
                 })?;
                 Self::run_process_request(
                     server_name,
                     "resources/list",
                     MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.list_resources(
+                    connection.list_resources(
                         request_id,
                         Some(McpListResourcesParams {
                             cursor: cursor.clone(),
@@ -944,18 +1041,18 @@ impl McpServerManager {
         let response =
             {
                 let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
+                let connection = server.connection.as_mut().ok_or_else(|| {
                     McpServerManagerError::InvalidResponse {
                         server_name: server_name.to_string(),
                         method: "resources/read",
-                        details: "server process missing after initialization".to_string(),
+                        details: "server connection missing after initialization".to_string(),
                     }
                 })?;
                 Self::run_process_request(
                     server_name,
                     "resources/read",
                     MCP_LIST_TOOLS_TIMEOUT_MS,
-                    process.read_resource(
+                    connection.read_resource(
                         request_id,
                         McpReadResourceParams {
                             uri: uri.to_string(),
@@ -983,14 +1080,14 @@ impl McpServerManager {
     }
 
     async fn reset_server(&mut self, server_name: &str) -> Result<(), McpServerManagerError> {
-        let mut process = {
+        let mut connection = {
             let server = self.server_mut(server_name)?;
             server.initialized = false;
-            server.process.take()
+            server.connection.take()
         };
 
-        if let Some(process) = process.as_mut() {
-            let _ = process.shutdown().await;
+        if let Some(connection) = connection.as_mut() {
+            let _ = connection.shutdown().await;
         }
 
         Ok(())
@@ -1056,14 +1153,14 @@ impl McpServerManager {
             let needs_spawn = self
                 .servers
                 .get(server_name)
-                .map(|server| server.process.is_none())
+                .map(|server| server.connection.is_none())
                 .ok_or_else(|| McpServerManagerError::UnknownServer {
                     server_name: server_name.to_string(),
                 })?;
 
             if needs_spawn {
                 let server = self.server_mut(server_name)?;
-                server.process = Some(spawn_mcp_stdio_process(&server.bootstrap)?);
+                server.connection = Some(spawn_mcp_connection(&server.bootstrap)?);
                 server.initialized = false;
             }
 
@@ -1082,18 +1179,18 @@ impl McpServerManager {
             let request_id = self.take_request_id();
             let response = {
                 let server = self.server_mut(server_name)?;
-                let process = server.process.as_mut().ok_or_else(|| {
+                let connection = server.connection.as_mut().ok_or_else(|| {
                     McpServerManagerError::InvalidResponse {
                         server_name: server_name.to_string(),
                         method: "initialize",
-                        details: "server process missing before initialize".to_string(),
+                        details: "server connection missing before initialize".to_string(),
                     }
                 })?;
                 Self::run_process_request(
                     server_name,
                     "initialize",
                     MCP_INITIALIZE_TIMEOUT_MS,
-                    process.initialize(request_id, default_initialize_params()),
+                    connection.initialize(request_id, default_initialize_params()),
                 )
                 .await
             };
@@ -1364,6 +1461,25 @@ impl McpStdioProcess {
         }
         let _ = self.child.wait().await?;
         Ok(())
+    }
+}
+
+/// Establish a transport-appropriate connection for a managed MCP server.
+fn spawn_mcp_connection(bootstrap: &McpClientBootstrap) -> io::Result<ManagedConnection> {
+    match &bootstrap.transport {
+        McpClientTransport::Stdio(transport) => {
+            Ok(ManagedConnection::Stdio(McpStdioProcess::spawn(transport)?))
+        }
+        McpClientTransport::Http(transport) => Ok(ManagedConnection::Http(
+            McpHttpClient::from_transport(transport)?,
+        )),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "MCP bootstrap transport for {} is not supported by the manager: {other:?}",
+                bootstrap.server_name
+            ),
+        )),
     }
 }
 
@@ -2777,10 +2893,12 @@ mod tests {
         let manager = McpServerManager::from_servers(&servers);
         let unsupported = manager.unsupported_servers();
 
-        assert_eq!(unsupported.len(), 3);
-        assert_eq!(unsupported[0].server_name, "http");
-        assert_eq!(unsupported[1].server_name, "sdk");
-        assert_eq!(unsupported[2].server_name, "ws");
+        // `http` (Streamable HTTP) is now a managed transport; only sdk + ws
+        // remain unsupported by the manager.
+        assert!(manager.server_names().contains(&"http".to_string()));
+        assert_eq!(unsupported.len(), 2);
+        assert_eq!(unsupported[0].server_name, "sdk");
+        assert_eq!(unsupported[1].server_name, "ws");
         assert_eq!(
             unsupported_server_failed_server(&unsupported[0]).phase,
             McpLifecyclePhase::ServerRegistration
