@@ -97,10 +97,8 @@ async fn send_message_posts_json_and_parses_response() {
     assert!(body.get("stream").is_none());
     assert_eq!(body["tools"][0]["name"], json!("get_weather"));
     assert_eq!(body["tool_choice"]["type"], json!("auto"));
-    assert_eq!(
-        body["betas"],
-        json!(["claude-code-20250219", "prompt-caching-scope-2026-01-05"])
-    );
+    // Betas travel in the `anthropic-beta` header only — never in the body.
+    assert!(body.get("betas").is_none());
 }
 
 #[tokio::test]
@@ -156,14 +154,8 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be json");
     assert_eq!(body["metadata"]["source"], json!("clawd-code"));
-    assert_eq!(
-        body["betas"],
-        json!([
-            "claude-code-20250219",
-            "prompt-caching-scope-2026-01-05",
-            "tools-2026-04-01"
-        ])
-    );
+    // Betas travel in the `anthropic-beta` header only — never in the body.
+    assert!(body.get("betas").is_none());
 
     let events = sink.events();
     assert_eq!(events.len(), 6);

@@ -124,7 +124,7 @@ pub fn resolve_model_alias(model: &str) -> String {
         .find_map(|(alias, metadata)| {
             (*alias == lower).then_some(match metadata.provider {
                 ProviderKind::Anthropic => match *alias {
-                    "opus" => "claude-opus-4-6",
+                    "opus" => "claude-opus-4-8",
                     "sonnet" => "claude-sonnet-4-6",
                     "haiku" => "claude-haiku-4-5-20251213",
                     _ => trimmed,
